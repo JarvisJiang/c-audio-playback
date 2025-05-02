@@ -1,12 +1,14 @@
 #include <alsa/asoundlib.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h> // For memset (though not used in new fill_buffer)
 #include <unistd.h> // For usleep/sleep - Linux specific
+#include <math.h>   // For sin()
 
 // --- Compilation Instructions (Linux) ---
 // You need the ALSA development library installed (e.g., libasound2-dev on Debian/Ubuntu)
 // Compile using GCC:
-// gcc alsa_mmap_playback.c -o alsa_mmap_playback -lasound
+// gcc alsa_mmap_playback.c -o alsa_mmap_playback -lasound -lm
 //
 // Run:
 // ./alsa_mmap_playback
@@ -22,36 +24,114 @@
 // int interleaved; // Whether the MMAP buffer is interleaved (usually 1 for MMAP)
 // ---------------------------------------------
 
-// Function to fill the buffer (replace with your actual audio data source)
+// Global state for audio generation
+static double g_phase1 = 0.0;
+static double g_phase2 = 0.0;
+static double g_phase3 = 0.0;
+static unsigned long long g_sample_count = 0;
+static double g_freq2 = 220.0; // Start frequency for second oscillator
+static double g_lfo_phase = 0.0;
+
+#ifndef PI
+#define PI 3.14159265358979323846
+#endif
+
+// Generates a single stereo audio sample (S16_LE format assumed)
+// Updates global phase/state variables
+short generate_audio_sample() {
+    // Assuming 44100 Hz rate
+    double rate = 44100.0;
+    short max_amplitude = 32760;
+
+    // Frequencies for oscillators
+    double freq1 = 110.0; // Low drone (A2)
+
+    // LFO for frequency modulation of freq2 and amplitude modulation of freq3
+    double lfo_freq = 0.5; // Slow LFO
+    double lfo_amp_mod_depth = 0.5; // Tremolo depth for freq3
+    double lfo_freq_mod_depth = 50.0; // Vibrato depth for freq2
+
+    // Frequency sweep for freq2 (simple linear sweep up and down over 10 seconds)
+    double sweep_period_samples = 10.0 * rate;
+
+    // Update g_freq2 based on sweep position *before* calculating sample
+    double time_in_sweep = fmod((double)g_sample_count, sweep_period_samples);
+    double sweep_progress = time_in_sweep / sweep_period_samples;
+    if (sweep_progress < 0.5) {
+         g_freq2 = 220.0 + (440.0 - 220.0) * (sweep_progress * 2.0); // Sweep up
+    } else {
+         g_freq2 = 440.0 - (440.0 - 220.0) * ((sweep_progress - 0.5) * 2.0); // Sweep down
+    }
+    double freq3 = g_freq2 * 2.0; // One octave higher than freq2
+
+    // Calculate LFO value
+    double lfo_val = sin(g_lfo_phase);
+    g_lfo_phase += 2.0 * PI * lfo_freq / rate;
+    if (g_lfo_phase >= 2.0 * PI) g_lfo_phase -= 2.0 * PI;
+
+    // Calculate modulated frequencies and amplitudes
+    double current_freq2 = g_freq2 + lfo_val * lfo_freq_mod_depth;
+    double current_freq3 = freq3; // Keep freq3 stable relative to base g_freq2 for now
+    double amp3_mod = 1.0 - (lfo_amp_mod_depth * (1.0 + lfo_val) / 2.0); // Amplitude modulation for freq3
+
+    // Generate samples for each oscillator
+    double sample1 = sin(g_phase1);
+    double sample2 = sin(g_phase2);
+    double sample3 = sin(g_phase3);
+
+    // Combine samples (adjust amplitudes to prevent clipping)
+    double combined_sample = (sample1 * 0.3 + sample2 * 0.4 + sample3 * amp3_mod * 0.3);
+
+    // Convert to S16_LE format
+    short pcm_sample = (short)(combined_sample * max_amplitude);
+
+    // Update phases for next sample
+    g_phase1 += 2.0 * PI * freq1 / rate;
+    if (g_phase1 >= 2.0 * PI) g_phase1 -= 2.0 * PI;
+    g_phase2 += 2.0 * PI * current_freq2 / rate;
+    if (g_phase2 >= 2.0 * PI) g_phase2 -= 2.0 * PI;
+    g_phase3 += 2.0 * PI * current_freq3 / rate;
+     if (g_phase3 >= 2.0 * PI) g_phase3 -= 2.0 * PI;
+
+    g_sample_count++; // Increment global sample counter
+
+    return pcm_sample;
+}
+
+// Function to fill the buffer by calling the sample generator
 void fill_buffer(const snd_pcm_channel_area_t *areas, snd_pcm_uframes_t offset,
                  snd_pcm_uframes_t frames, snd_pcm_format_t format, unsigned int channels, int interleaved) {
-    // Example: Fill with silence or generate a sine wave
-    // This is where you would copy your audio data into the mapped buffer areas.
-    // The structure of 'areas' depends on whether the format is interleaved or not.
-    // For interleaved: areas[0].addr points to the buffer, areas[0].step is bits per sample.
-    // For non-interleaved: areas[channel].addr points to the buffer for that channel.
 
-    fprintf(stdout, "Filling buffer: offset=%lu, frames=%lu\n", offset, frames);
-
-    // Placeholder: Zero out the buffer (silence)
-    unsigned int chn;
-    int bits_per_sample = snd_pcm_format_width(format);
-    int bytes_per_frame = (bits_per_sample / 8) * channels;
+    // Assuming SND_PCM_FORMAT_S16_LE
+    int bits_per_sample = 16;
     int bytes_per_sample = bits_per_sample / 8;
 
-    if (interleaved) {
-        // Calculate pointer based on area->addr + (offset * area->step / 8)
-        // area->step is in bits, so divide by 8 for byte offset
-        unsigned char *buffer_start = ((unsigned char *)areas[0].addr) + (offset * areas[0].step / 8);
-        memset(buffer_start, 0, frames * bytes_per_frame);
-    } else {
-        for (chn = 0; chn < channels; ++chn) {
-             // Calculate pointer based on area->addr + (offset * area->step / 8)
-            unsigned char *channel_buffer = ((unsigned char *)areas[chn].addr) + (offset * areas[chn].step / 8);
-             memset(channel_buffer, 0, frames * bytes_per_sample);
+    // Optional: Print status less frequently
+    // static unsigned long long last_print_sample = 0;
+    // if (g_sample_count >= last_print_sample + 44100) { // Print roughly every second
+    //     fprintf(stdout, "Filling buffer: offset=%lu, frames=%lu (sample %llu)\n", offset, frames, g_sample_count);
+    //     last_print_sample = g_sample_count;
+    // }
+
+
+    for (snd_pcm_uframes_t i = 0; i < frames; ++i) {
+        short pcm_sample = generate_audio_sample();
+
+        // Write sample to buffer for all channels
+        for (unsigned int chn = 0; chn < channels; ++chn) {
+            unsigned char *ptr;
+            if (interleaved) {
+                // area->step is in bits, includes stride for all channels
+                ptr = ((unsigned char *)areas[0].addr) + ((offset + i) * areas[0].step / 8) + (chn * bytes_per_sample);
+            } else {
+                 // area->step is in bits for a single channel
+                ptr = ((unsigned char *)areas[chn].addr) + ((offset + i) * areas[chn].step / 8);
+            }
+             // Assuming Little Endian for S16_LE
+            ptr[0] = (unsigned char)(pcm_sample & 0xFF);
+            ptr[1] = (unsigned char)((pcm_sample >> 8) & 0xFF);
         }
     }
-    // --- End Placeholder ---
 }
 
 
