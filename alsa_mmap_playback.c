@@ -1,19 +1,19 @@
 #include <alsa/asoundlib.h>
 #include <stdio.h>
 #include <stdlib.h>
-// unistd.h is typically POSIX, might need alternatives on non-POSIX systems
-// For MinGW/Windows, you might need specific Windows headers for sleep functions
-// or use a cross-platform library. For this example, we assume POSIX or similar.
-#ifdef _WIN32
-#include <windows.h>
-#define sleep(seconds) Sleep((seconds) * 1000)
-#define usleep(microseconds) Sleep((microseconds) / 1000) // Approximated
-#else
-#include <unistd.h> // For usleep/sleep
-#endif
+#include <unistd.h> // For usleep/sleep - Linux specific
+
+// --- Compilation Instructions (Linux) ---
+// You need the ALSA development library installed (e.g., libasound2-dev on Debian/Ubuntu)
+// Compile using GCC:
+// gcc alsa_mmap_playback.c -o alsa_mmap_playback -lasound
+//
+// Run:
+// ./alsa_mmap_playback
+// -----------------------------------------
 
 
-// --- Assumed variables (already initialized) ---
+// --- Assumed variables (already initialized within run_alsa_mmap_loop) ---
 // snd_pcm_t *handle; // PCM device handle
 // snd_pcm_uframes_t period_size; // Size of one period in frames
 // unsigned int channels; // Number of audio channels
@@ -272,9 +272,62 @@ int run_alsa_mmap_loop(snd_pcm_t *handle, snd_pcm_uframes_t period_size, snd_pcm
     return 0; // Should not be reached in an infinite loop
 }
 
-/*
-// --- Example Usage Placeholder ---
+// Function to list available sound cards
+void list_sound_cards() {
+    int card = -1;
+    int err;
+    char card_name[32];
+
+    printf("Available ALSA Sound Cards:\n");
+    printf("---------------------------\n");
+
+    if ((err = snd_card_next(&card)) < 0) {
+        fprintf(stderr, "Cannot get first card number: %s\n", snd_strerror(err));
+        return;
+    }
+    if (card < 0) {
+        fprintf(stderr, "No sound cards found.\n");
+        return;
+    }
+
+    while (card >= 0) {
+        snd_ctl_t *handle;
+        snd_ctl_card_info_t *info;
+        char ctl_name[32];
+
+        sprintf(ctl_name, "hw:%d", card);
+        if ((err = snd_ctl_open(&handle, ctl_name, 0)) < 0) {
+            fprintf(stderr, "Cannot open control for card %d: %s\n", card, snd_strerror(err));
+            goto next_card;
+        }
+
+        snd_ctl_card_info_alloca(&info);
+        if ((err = snd_ctl_card_info(handle, info)) < 0) {
+            fprintf(stderr, "Cannot get card info for card %d: %s\n", card, snd_strerror(err));
+            snd_ctl_close(handle);
+            goto next_card;
+        }
+
+        printf("Card %d: [%s] - %s\n", card, snd_ctl_card_info_get_id(info), snd_ctl_card_info_get_name(info));
+        // You could also get snd_ctl_card_info_get_longname(info) for more details
+
+        snd_ctl_close(handle);
+
+    next_card:
+        if ((err = snd_card_next(&card)) < 0) {
+            fprintf(stderr, "Cannot get next card number: %s\n", snd_strerror(err));
+            break;
+        }
+    }
+     printf("---------------------------\n");
+}
+
+
+// --- Main Function ---
 int main() {
+    // List sound cards first
+    list_sound_cards();
+
     snd_pcm_t *handle;
     snd_pcm_hw_params_t *hw_params;
     snd_pcm_sw_params_t *sw_params;
@@ -408,4 +461,3 @@ int main() {
 
     return 0;
 }
-*/
