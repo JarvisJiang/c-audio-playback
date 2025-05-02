@@ -36,60 +36,90 @@ static double g_lfo_phase = 0.0;
 #define PI 3.14159265358979323846
 #endif
 
-// Generates a single stereo audio sample (S16_LE format assumed)
+// Simple low-pass filter state for noise
+static double noise_lpf_state = 0.0;
+
+// Generates a single audio sample (S16_LE format assumed) trying for a "powerful" sound
 // Updates global phase/state variables
 short generate_audio_sample() {
     // Assuming 44100 Hz rate
     double rate = 44100.0;
     short max_amplitude = 32760;
 
-    // Frequencies for oscillators
-    double freq1 = 110.0; // Low drone (A2)
+    // --- Oscillators ---
+    double freq1 = 55.0; // Lower drone (A1)
 
-    // LFO for frequency modulation of freq2 and amplitude modulation of freq3
-    double lfo_freq = 0.5; // Slow LFO
-    double lfo_amp_mod_depth = 0.5; // Tremolo depth for freq3
-    double lfo_freq_mod_depth = 50.0; // Vibrato depth for freq2
+    // LFO for modulation
+    double lfo_freq = 1.0; // Slightly faster LFO
+    double lfo_amp_mod_depth = 0.6; // Deeper tremolo
+    double lfo_freq_mod_depth = 30.0; // Less extreme vibrato
 
-    // Frequency sweep for freq2 (simple linear sweep up and down over 10 seconds)
-    double sweep_period_samples = 10.0 * rate;
-
-    // Update g_freq2 based on sweep position *before* calculating sample
+    // Frequency sweep for osc2 (A3 to A4 and back over 8 seconds)
+    double sweep_period_samples = 8.0 * rate;
     double time_in_sweep = fmod((double)g_sample_count, sweep_period_samples);
     double sweep_progress = time_in_sweep / sweep_period_samples;
     if (sweep_progress < 0.5) {
-         g_freq2 = 220.0 + (440.0 - 220.0) * (sweep_progress * 2.0); // Sweep up
+         g_freq2 = 220.0 + (440.0 - 220.0) * (sweep_progress * 2.0); // Sweep up A3->A4
     } else {
-         g_freq2 = 440.0 - (440.0 - 220.0) * ((sweep_progress - 0.5) * 2.0); // Sweep down
+         g_freq2 = 440.0 - (440.0 - 220.0) * ((sweep_progress - 0.5) * 2.0); // Sweep down A4->A3
     }
-    double freq3 = g_freq2 * 2.0; // One octave higher than freq2
+    double freq3 = g_freq2 * 1.5; // A fifth above osc2 (approx E4/E5)
 
-    // Calculate LFO value
+    // Calculate LFO value (sine wave)
     double lfo_val = sin(g_lfo_phase);
     g_lfo_phase += 2.0 * PI * lfo_freq / rate;
     if (g_lfo_phase >= 2.0 * PI) g_lfo_phase -= 2.0 * PI;
 
-    // Calculate modulated frequencies and amplitudes
-    double current_freq2 = g_freq2 + lfo_val * lfo_freq_mod_depth;
-    double current_freq3 = freq3; // Keep freq3 stable relative to base g_freq2 for now
-    double amp3_mod = 1.0 - (lfo_amp_mod_depth * (1.0 + lfo_val) / 2.0); // Amplitude modulation for freq3
+    // Modulate frequencies and amplitudes
+    double current_freq2 = g_freq2 + lfo_val * lfo_freq_mod_depth; // Vibrato on osc2
+    double current_freq3 = freq3; // Keep base freq3 stable for now
+    double amp3_mod = 1.0 - (lfo_amp_mod_depth * (1.0 + lfo_val) / 2.0); // Tremolo on osc3
 
-    // Generate samples for each oscillator
+    // --- Generate Waveforms ---
+    // Osc1: Simple Sine Drone
     double sample1 = sin(g_phase1);
-    double sample2 = sin(g_phase2);
-    double sample3 = sin(g_phase3);
 
-    // Combine samples (adjust amplitudes to prevent clipping)
-    double combined_sample = (sample1 * 0.3 + sample2 * 0.4 + sample3 * amp3_mod * 0.3);
+    // Osc2: Sawtooth approximation (fundamental + first 3 harmonics)
+    double sample2 = sin(g_phase2);
+    sample2 += 0.5 * sin(2.0 * g_phase2);
+    sample2 += 0.33 * sin(3.0 * g_phase2);
+    sample2 += 0.25 * sin(4.0 * g_phase2);
+    sample2 *= 0.6; // Normalize roughly
+
+    // Osc3: Square wave approximation (fundamental + 2 odd harmonics)
+    double sample3 = sin(g_phase3);
+    sample3 += 0.33 * sin(3.0 * g_phase3);
+    sample3 += 0.2 * sin(5.0 * g_phase3);
+    sample3 *= 0.7; // Normalize roughly
+    sample3 *= amp3_mod; // Apply tremolo
+
+    // Noise Component: Simple white noise -> low-pass filter
+    double noise = ((double)rand() / RAND_MAX) * 2.0 - 1.0; // White noise -1 to 1
+    double lpf_cutoff = 0.1; // Adjust cutoff frequency (lower = more muffled)
+    noise_lpf_state += lpf_cutoff * (noise - noise_lpf_state);
+    double filtered_noise = noise_lpf_state;
+
+
+    // --- Combine Components ---
+    // Adjust amplitudes for a more "powerful" mix (more bass, more noise)
+    double combined_sample = (sample1 * 0.4) + (sample2 * 0.3) + (sample3 * 0.2) + (filtered_noise * 0.15);
+
+    // Simple clipping (alternative to scaling down max_amplitude)
+    if (combined_sample > 1.0) combined_sample = 1.0;
+    if (combined_sample < -1.0) combined_sample = -1.0;
 
     // Convert to S16_LE format
     short pcm_sample = (short)(combined_sample * max_amplitude);
 
-    // Update phases for next sample
+    // --- Update Phases ---
     g_phase1 += 2.0 * PI * freq1 / rate;
     if (g_phase1 >= 2.0 * PI) g_phase1 -= 2.0 * PI;
+
+    // Use the *modulated* frequency for phase update
     g_phase2 += 2.0 * PI * current_freq2 / rate;
     if (g_phase2 >= 2.0 * PI) g_phase2 -= 2.0 * PI;
+
+    // Use the *unmodulated* frequency for phase update (tremolo affects amplitude only)
     g_phase3 += 2.0 * PI * current_freq3 / rate;
      if (g_phase3 >= 2.0 * PI) g_phase3 -= 2.0 * PI;
 
