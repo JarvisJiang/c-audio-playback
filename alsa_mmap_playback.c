@@ -1,14 +1,16 @@
 #include <alsa/asoundlib.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h> // For memset (though not used in new fill_buffer)
+#include <string.h> // For memset
 #include <unistd.h> // For usleep/sleep - Linux specific
 #include <math.h>   // For sin()
+#include <pthread.h> // For threading
+#include <signal.h> // For signal handling (optional shutdown)
 
 // --- Compilation Instructions (Linux) ---
 // You need the ALSA development library installed (e.g., libasound2-dev on Debian/Ubuntu)
 // Compile using GCC:
-// gcc alsa_mmap_playback.c -o alsa_mmap_playback -lasound -lm
+// gcc alsa_mmap_playback.c -o alsa_mmap_playback -lasound -lm -lpthread
 //
 // Run:
 // ./alsa_mmap_playback
@@ -35,6 +37,33 @@ static double g_lfo_phase = 0.0;
 #ifndef PI
 #define PI 3.14159265358979323846
 #endif
+
+// --- Ring Buffer Implementation ---
+typedef struct {
+    short *buffer;          // Data buffer
+    size_t size;            // Size of buffer in samples (total capacity)
+    size_t write_pos;       // Index to write next sample
+    size_t read_pos;        // Index to read next sample
+    size_t count;           // Number of samples currently in buffer
+} ring_buffer_t;
+
+// --- Shared Data Structure for Threads ---
+typedef struct {
+    snd_pcm_t *playback_handle;
+    snd_pcm_t *capture_handle;
+    snd_pcm_uframes_t period_size;
+    snd_pcm_format_t format;
+    unsigned int channels;
+    int playback_interleaved;
+
+    ring_buffer_t shared_buffer; // Ring buffer for captured audio
+    pthread_mutex_t buffer_mutex; // Mutex to protect the buffer
+    pthread_cond_t cond_not_full; // Condition: buffer is not full (capture waits)
+    pthread_cond_t cond_not_empty; // Condition: buffer is not empty (playback waits)
+
+    volatile sig_atomic_t running; // Flag to signal threads to stop
+} audio_thread_data_t;
+
 
 // Simple low-pass filter state for noise
 static double noise_lpf_state = 0.0;
@@ -128,55 +157,88 @@ short generate_audio_sample() {
     return pcm_sample;
 }
 
-// Function to fill the buffer by calling the sample generator
-void fill_buffer(const snd_pcm_channel_area_t *areas, snd_pcm_uframes_t offset,
-                 snd_pcm_uframes_t frames, snd_pcm_format_t format, unsigned int channels, int interleaved) {
+// Function to fill the playback buffer by mixing generated audio and captured audio
+void mix_and_fill_buffer(const snd_pcm_channel_area_t *areas, snd_pcm_uframes_t offset,
+                         snd_pcm_uframes_t frames, snd_pcm_format_t format, unsigned int channels, int interleaved,
+                         audio_thread_data_t *data) {
 
     // Assuming SND_PCM_FORMAT_S16_LE
     int bits_per_sample = 16;
     int bytes_per_sample = bits_per_sample / 8;
-
-    // Optional: Print status less frequently
-    // static unsigned long long last_print_sample = 0;
-    // if (g_sample_count >= last_print_sample + 44100) { // Print roughly every second
-    //     fprintf(stdout, "Filling buffer: offset=%lu, frames=%lu (sample %llu)\n", offset, frames, g_sample_count);
-    //     last_print_sample = g_sample_count;
-    // }
-
+    short max_amplitude = 32760;
+    ring_buffer_t *rb = &data->shared_buffer;
+    short captured_sample = 0;
 
     for (snd_pcm_uframes_t i = 0; i < frames; ++i) {
-        short pcm_sample = generate_audio_sample();
+        short generated_sample = generate_audio_sample();
+        captured_sample = 0; // Default to silence if capture buffer is empty
 
-        // Write sample to buffer for all channels
+        // --- Read from shared ring buffer ---
+        pthread_mutex_lock(&data->buffer_mutex);
+        // Wait until there's data or we are shutting down
+        while (rb->count == 0 && data->running) {
+            // Optional: Timeout for pthread_cond_timedwait if needed
+            pthread_cond_wait(&data->cond_not_empty, &data->buffer_mutex);
+        }
+
+        if (data->running && rb->count > 0) {
+            captured_sample = rb->buffer[rb->read_pos];
+            rb->read_pos = (rb->read_pos + 1) % rb->size;
+            rb->count--;
+            // Signal capture thread that there's space now
+            pthread_cond_signal(&data->cond_not_full);
+        }
+        pthread_mutex_unlock(&data->buffer_mutex);
+        // --- End Read ---
+
+        if (!data->running) break; // Exit loop if shutting down
+
+        short mixed_sample;
+        // Simple mix - adjust volumes (e.g., 50% generated, 50% captured)
+        long temp_mix = (long)generated_sample * 0.5 + (long)captured_sample * 0.5;
+
+        // Clipping
+        if (temp_mix > max_amplitude) mixed_sample = max_amplitude;
+        else if (temp_mix < -max_amplitude) mixed_sample = -max_amplitude;
+        else mixed_sample = (short)temp_mix;
+
+
+        // Write mixed sample to playback buffer
         for (unsigned int chn = 0; chn < channels; ++chn) {
             unsigned char *ptr;
             if (interleaved) {
-                // area->step is in bits, includes stride for all channels
                 ptr = ((unsigned char *)areas[0].addr) + ((offset + i) * areas[0].step / 8) + (chn * bytes_per_sample);
             } else {
-                 // area->step is in bits for a single channel
                 ptr = ((unsigned char *)areas[chn].addr) + ((offset + i) * areas[chn].step / 8);
             }
-             // Assuming Little Endian for S16_LE
-            ptr[0] = (unsigned char)(pcm_sample & 0xFF);
-            ptr[1] = (unsigned char)((pcm_sample >> 8) & 0xFF);
+            ptr[0] = (unsigned char)(mixed_sample & 0xFF);
+            ptr[1] = (unsigned char)((mixed_sample >> 8) & 0xFF);
         }
     }
 }
 
 
-int run_alsa_mmap_loop(snd_pcm_t *handle, snd_pcm_uframes_t period_size, snd_pcm_format_t format, unsigned int channels, int interleaved) {
+// Playback loop function for the playback thread
+void *playback_thread_func(void *arg) {
+    audio_thread_data_t *data = (audio_thread_data_t *)arg;
+    snd_pcm_t *handle = data->playback_handle;
+    snd_pcm_uframes_t period_size = data->period_size;
+    snd_pcm_format_t format = data->format;
+    unsigned int channels = data->channels;
+    int interleaved = data->playback_interleaved;
+
     int err;
     snd_pcm_uframes_t offset, frames, avail;
     const snd_pcm_channel_area_t *areas;
     snd_pcm_status_t *status;
 
+    printf("Playback thread started.\n");
     snd_pcm_status_alloca(&status);
 
-    while (1) { // Main playback loop
+    while (data->running) { // Main playback loop controlled by flag
         // Wait for the PCM device to be ready for writing
-        // Timeout set to 1 second (1000 ms)
-        err = snd_pcm_wait(handle, 1000);
+        // Timeout set to 100ms for responsiveness to shutdown signal
+        err = snd_pcm_wait(handle, 100);
         if (err < 0) {
             fprintf(stderr, "PCM wait error: %s\n", snd_strerror(err));
             // Handle buffer underrun (XRUN) if err == -EPIPE
@@ -185,37 +247,42 @@ int run_alsa_mmap_loop(snd_pcm_t *handle, snd_pcm_uframes_t period_size, snd_pcm
                 err = snd_pcm_prepare(handle); // Try to recover
                 if (err < 0) {
                     fprintf(stderr, "Failed to recover from underrun: %s\n", snd_strerror(err));
-                    return err;
+                    data->running = 0; // Signal exit
+                    return NULL;
                 }
                 continue; // Try waiting again
             } else {
-                return err; // Other wait error
+                 data->running = 0; // Signal exit
+                 return NULL; // Other wait error
             }
         } else if (err == 0) {
-             fprintf(stderr, "PCM wait timed out after 1 second.\n");
+             //fprintf(stderr, "PCM wait timed out after 100ms.\n");
              // Timeout might indicate a problem, check status
              if (snd_pcm_status(handle, status) == 0) {
                  snd_pcm_state_t state = snd_pcm_status_get_state(status);
-                 fprintf(stderr, "PCM state after timeout: %s\n", snd_pcm_state_name(state));
+                 //fprintf(stderr, "PCM state after timeout: %s\n", snd_pcm_state_name(state));
                  if (state == SND_PCM_STATE_XRUN) {
                      fprintf(stderr, "XRUN detected after wait timeout!\n");
                      err = snd_pcm_prepare(handle);
-                     if (err < 0) return err;
+                     if (err < 0) { data->running = 0; return NULL; }
                  } else if (state == SND_PCM_STATE_SUSPENDED) {
                      fprintf(stderr, "PCM suspended after wait timeout!\n");
                      while ((err = snd_pcm_resume(handle)) == -EAGAIN) sleep(1);
                      if (err < 0) {
                          err = snd_pcm_prepare(handle);
-                         if (err < 0) return err;
+                         if (err < 0) { data->running = 0; return NULL; }
                      }
                  }
              }
-             continue; // Timeout, just try again
+             // Timeout is expected if buffer is full or during shutdown
+             if (!data->running) break; // Exit if shutting down
+             continue;
         }
 
 
         // Find out how much space is available
         avail = snd_pcm_avail_update(handle);
+        if (!data->running) break; // Exit if shutting down
         if (avail < 0) {
             fprintf(stderr, "PCM avail update error: %s\n", snd_strerror((int)avail));
              if (avail == -EPIPE) {
@@ -223,12 +290,12 @@ int run_alsa_mmap_loop(snd_pcm_t *handle, snd_pcm_uframes_t period_size, snd_pcm
                 err = snd_pcm_prepare(handle); // Try to recover
                 if (err < 0) {
                     fprintf(stderr, "Failed to recover from underrun: %s\n", snd_strerror(err));
-                    return err;
+                    data->running = 0; return NULL;
                 }
                 continue; // Try again
             } else {
                 // Other error, potentially fatal for this stream
-                return (int)avail;
+                 data->running = 0; return NULL;
             }
         }
 
@@ -243,7 +310,7 @@ int run_alsa_mmap_loop(snd_pcm_t *handle, snd_pcm_uframes_t period_size, snd_pcm
                      err = snd_pcm_prepare(handle);
                      if (err < 0) {
                          fprintf(stderr, "Failed to recover from XRUN: %s\n", snd_strerror(err));
-                         return err;
+                         data->running = 0; return NULL;
                      }
                      continue; // Retry loop
                  } else if (state == SND_PCM_STATE_SUSPENDED) {
@@ -256,7 +323,7 @@ int run_alsa_mmap_loop(snd_pcm_t *handle, snd_pcm_uframes_t period_size, snd_pcm
                            err = snd_pcm_prepare(handle);
                            if (err < 0) {
                                 fprintf(stderr, "Failed to recover from suspend: %s\n", snd_strerror(err));
-                                return err;
+                                data->running = 0; return NULL;
                            }
                       }
                       continue; // Retry loop
@@ -271,17 +338,21 @@ int run_alsa_mmap_loop(snd_pcm_t *handle, snd_pcm_uframes_t period_size, snd_pcm
                  }
              }
             // Not enough space yet, wait a bit and loop again
-            // This can happen if the period size is large or system is busy
-            //fprintf(stdout, "Waiting for buffer space (avail=%lu, needed=%lu)\n", avail, period_size);
-            usleep(10000); // Wait 10ms before checking again
+            usleep(5000); // Wait 5ms before checking again
             continue;
         }
 
-        // We have enough space, let's try to write one period
-        frames = period_size;
+        // We have enough space, let's try to write one period (or less if avail < period_size)
+        frames = (avail >= period_size) ? period_size : avail;
+        if (frames == 0) {
+            usleep(5000);
+            continue;
+        }
+
 
         // Request access to the MMAP buffer area
         err = snd_pcm_mmap_begin(handle, &areas, &offset, &frames);
+        if (!data->running) break; // Exit if shutting down
         if (err < 0) {
             fprintf(stderr, "MMAP begin error: %s\n", snd_strerror(err));
              if (err == -EPIPE) {
@@ -289,7 +360,7 @@ int run_alsa_mmap_loop(snd_pcm_t *handle, snd_pcm_uframes_t period_size, snd_pcm
                 err = snd_pcm_prepare(handle); // Try to recover
                 if (err < 0) {
                     fprintf(stderr, "Failed to recover from underrun: %s\n", snd_strerror(err));
-                    return err;
+                    data->running = 0; return NULL;
                 }
                 continue; // Try again
             } else if (err == -ESTRPIPE) { // Stream is suspended
@@ -301,39 +372,35 @@ int run_alsa_mmap_loop(snd_pcm_t *handle, snd_pcm_uframes_t period_size, snd_pcm
                      err = snd_pcm_prepare(handle);
                      if (err < 0) {
                          fprintf(stderr, "Failed to recover from suspend: %s\n", snd_strerror(err));
-                         return err;
+                         data->running = 0; return NULL;
                      }
                  }
                  continue; // Retry loop
             } else {
                 // Other error, potentially fatal
-                return err;
+                 data->running = 0; return NULL;
             }
         }
 
         // Check if we got the number of frames we asked for
         // This shouldn't happen often if avail >= period_size, but good to check
-        if (frames < period_size) {
-            fprintf(stderr, "Warning: mmap_begin returned less frames (%lu) than requested (%lu)\n", frames, period_size);
-            // This might indicate a configuration issue or an XRUN is imminent
-            // We could try to handle this, but for simplicity, we'll proceed if frames > 0
-            if (frames == 0) {
-                 fprintf(stderr, "Error: mmap_begin returned 0 frames. Preparing stream.\n");
-                 // Attempt to commit 0 frames to potentially clear state, then prepare
-                 snd_pcm_mmap_commit(handle, offset, 0); // Commit might fail, ignore error here
-                 err = snd_pcm_prepare(handle);
-                 if (err < 0) {
-                     fprintf(stderr, "Failed to prepare after 0 frames from mmap_begin: %s\n", snd_strerror(err));
-                     return err;
-                 }
-                 continue; // Retry loop
-            }
-            // If frames > 0 but < period_size, we fill what we got
+        if (frames < period_size && avail >= period_size) { // Only warn if we expected full period
+            fprintf(stderr, "Warning: mmap_begin returned less frames (%lu) than requested (%lu) despite avail=%lu\n", frames, period_size, avail);
+        }
+        if (frames == 0) {
+             fprintf(stderr, "Error: mmap_begin returned 0 frames. Preparing stream.\n");
+             // Attempt to commit 0 frames to potentially clear state, then prepare
+             snd_pcm_mmap_commit(handle, offset, 0); // Commit might fail, ignore error here
+             err = snd_pcm_prepare(handle);
+             if (err < 0) {
+                 fprintf(stderr, "Failed to prepare after 0 frames from mmap_begin: %s\n", snd_strerror(err));
+                 data->running = 0; return NULL;
+             }
+             continue; // Retry loop
         }
 
-        // --- Fill the buffer with your audio data ---
-        // Pass the actual number of frames obtained ('frames')
-        fill_buffer(areas, offset, frames, format, channels, interleaved);
+        // --- Fill the buffer with mixed audio data ---
+        mix_and_fill_buffer(areas, offset, frames, format, channels, interleaved, data);
         // --------------------------------------------
 
         // Commit the frames (tell ALSA we've written them)
@@ -346,7 +413,7 @@ int run_alsa_mmap_loop(snd_pcm_t *handle, snd_pcm_uframes_t period_size, snd_pcm
                 err = snd_pcm_prepare(handle); // Try to recover
                 if (err < 0) {
                     fprintf(stderr, "Failed to recover from underrun: %s\n", snd_strerror(err));
-                    return err;
+                    data->running = 0; return NULL;
                 }
                 // Don't continue immediately, let the loop re-evaluate state
             } else if (committed == -ESTRPIPE) { // Stream is suspended
@@ -358,7 +425,7 @@ int run_alsa_mmap_loop(snd_pcm_t *handle, snd_pcm_uframes_t period_size, snd_pcm
                      err = snd_pcm_prepare(handle);
                      if (err < 0) {
                          fprintf(stderr, "Failed to recover from suspend: %s\n", snd_strerror(err));
-                         return err;
+                         data->running = 0; return NULL;
                      }
                  }
             } else {
@@ -367,20 +434,109 @@ int run_alsa_mmap_loop(snd_pcm_t *handle, snd_pcm_uframes_t period_size, snd_pcm
                  err = snd_pcm_prepare(handle);
                  if (err < 0) {
                      fprintf(stderr, "Failed to prepare after commit error: %s\n", snd_strerror(err));
-                     return err;
+                     data->running = 0; return NULL;
                  }
             }
+             if (!data->running) break; // Exit if shutting down
              continue; // Re-check state in the next loop iteration
         }
-
-        // Optional: Add a small sleep if CPU usage is too high,
-        // but snd_pcm_wait should handle blocking efficiently.
-        // usleep(1000);
     }
 
-    // snd_pcm_status_free(status); // Not needed with alloca
-    return 0; // Should not be reached in an infinite loop
+    printf("Playback thread finished.\n");
+    return NULL;
 }
+
+
+// Capture loop function for the capture thread (using readi)
+void *capture_thread_func(void *arg) {
+    audio_thread_data_t *data = (audio_thread_data_t *)arg;
+    snd_pcm_t *handle = data->capture_handle;
+    snd_pcm_uframes_t period_size = data->period_size;
+    unsigned int channels = data->channels;
+    ring_buffer_t *rb = &data->shared_buffer;
+    int err;
+    snd_pcm_sframes_t frames_read;
+
+    // Allocate local buffer for reading one period
+    int bytes_per_frame = snd_pcm_format_width(data->format) / 8 * channels;
+    short *local_buffer = malloc(period_size * bytes_per_frame);
+    if (!local_buffer) {
+        fprintf(stderr, "Capture thread: Failed to allocate local buffer\n");
+        data->running = 0; // Signal other threads to stop
+        return NULL;
+    }
+
+    printf("Capture thread started.\n");
+
+    while (data->running) {
+        frames_read = snd_pcm_readi(handle, local_buffer, period_size);
+
+        if (!data->running) break; // Check flag after potentially blocking read
+
+        if (frames_read < 0) {
+            fprintf(stderr, "Capture error: %s\n", snd_strerror(frames_read));
+            if (frames_read == -EPIPE) { // Overrun
+                fprintf(stderr, "Capture overrun occurred! Preparing...\n");
+                err = snd_pcm_prepare(handle);
+                if (err < 0) { fprintf(stderr, "Capture prepare failed: %s\n", snd_strerror(err)); data->running = 0; break; }
+                continue;
+            } else if (frames_read == -ESTRPIPE) { // Suspended
+                 fprintf(stderr, "Capture stream suspended! Attempting resume...\n");
+                 while ((err = snd_pcm_resume(handle)) == -EAGAIN) sleep(1);
+                 if (err < 0) {
+                     err = snd_pcm_prepare(handle);
+                     if (err < 0) { fprintf(stderr, "Capture recover failed: %s\n", snd_strerror(err)); data->running = 0; break; }
+                 }
+                 continue;
+            } else { data->running = 0; break; } // Other fatal error
+        } else if ((snd_pcm_uframes_t)frames_read != period_size) {
+            fprintf(stderr, "Capture short read: %ld frames instead of %lu\n", frames_read, period_size);
+        }
+
+        if (frames_read > 0) {
+            // --- Write captured data to shared ring buffer ---
+            size_t samples_to_write = frames_read * channels; // Assuming interleaved S16_LE
+            size_t samples_written = 0;
+
+            pthread_mutex_lock(&data->buffer_mutex);
+            while (samples_written < samples_to_write && data->running) {
+                // Wait if buffer is full
+                while (rb->count >= rb->size && data->running) {
+                    pthread_cond_wait(&data->cond_not_full, &data->buffer_mutex);
+                }
+                if (!data->running) break; // Check again after wait
+
+                // Write samples until buffer is full or all samples are written
+                size_t available_space = rb->size - rb->count;
+                size_t remaining_samples = samples_to_write - samples_written;
+                size_t chunk_size = (available_space < remaining_samples) ? available_space : remaining_samples;
+
+                // Copy in potentially two parts if wrap-around occurs
+                size_t part1_size = (rb->write_pos + chunk_size > rb->size) ? (rb->size - rb->write_pos) : chunk_size;
+                memcpy(rb->buffer + rb->write_pos, local_buffer + samples_written, part1_size * sizeof(short));
+
+                size_t part2_size = chunk_size - part1_size;
+                if (part2_size > 0) {
+                    memcpy(rb->buffer, local_buffer + samples_written + part1_size, part2_size * sizeof(short));
+                }
+
+                rb->write_pos = (rb->write_pos + chunk_size) % rb->size;
+                rb->count += chunk_size;
+                samples_written += chunk_size;
+
+                // Signal playback thread that data is available
+                pthread_cond_signal(&data->cond_not_empty);
+            }
+            pthread_mutex_unlock(&data->buffer_mutex);
+            // --- End Write ---
+        }
+    }
+
+    free(local_buffer);
+    printf("Capture thread finished.\n");
+    return NULL;
+}
+
 
 // Function to list available sound cards
 void list_sound_cards() {
@@ -433,140 +589,217 @@ void list_sound_cards() {
 }
 
 
+// Global pointer to thread data for signal handler
+static audio_thread_data_t *g_thread_data_ptr = NULL;
+
+// Signal handler for clean shutdown
+void signal_handler(int sig) {
+    printf("\nCaught signal %d, signaling threads to stop...\n", sig);
+    if (g_thread_data_ptr) {
+        g_thread_data_ptr->running = 0;
+        // Wake up threads potentially waiting on condition variables
+        pthread_cond_signal(&g_thread_data_ptr->cond_not_empty);
+        pthread_cond_signal(&g_thread_data_ptr->cond_not_full);
+    }
+    // Don't exit here, let main join threads
+}
+
+
 // --- Main Function ---
 int main() {
     // List sound cards first
     list_sound_cards();
 
-    snd_pcm_t *handle;
-    snd_pcm_hw_params_t *hw_params;
-    snd_pcm_sw_params_t *sw_params;
-    snd_pcm_uframes_t buffer_size;
-    snd_pcm_uframes_t period_size = 1024; // Example period size
+    // --- Playback Setup ---
+    snd_pcm_t *playback_handle;
+    snd_pcm_hw_params_t *playback_hw_params;
+    snd_pcm_sw_params_t *playback_sw_params;
+
+    // --- Capture Setup ---
+    snd_pcm_t *capture_handle;
+    snd_pcm_hw_params_t *capture_hw_params;
+    // snd_pcm_sw_params_t *capture_sw_params; // SW params less critical for basic readi capture
+
+    // --- Common Parameters ---
+    snd_pcm_uframes_t playback_buffer_size;
+    snd_pcm_uframes_t capture_buffer_size; // May differ from playback
+    snd_pcm_uframes_t period_size = 1024; // Keep period size consistent for simplicity
     unsigned int rate = 44100;
     unsigned int channels = 2;
     snd_pcm_format_t format = SND_PCM_FORMAT_S16_LE;
     int err;
-    int interleaved = 1; // Use interleaved MMAP
+    int playback_interleaved = 1; // Use interleaved MMAP for playback
 
-    const char *device = "default"; // Or "plughw:0,0" etc.
+    const char *playback_device = "default"; // Or "plughw:0,0" etc.
+    const char *capture_device = "default";  // Or specific capture device like "hw:0,0"
 
-    // 1. Open PCM device
-    // Use SND_PCM_NONBLOCK for snd_pcm_wait timeout to work correctly
-    // and to handle suspend/resume properly.
-    err = snd_pcm_open(&handle, device, SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK);
-    if (err < 0) {
-        fprintf(stderr, "Cannot open audio device %s (%s)\n", device, snd_strerror(err));
-        return 1;
-    }
-    printf("Audio device opened: %s\n", device);
+    // --- Threading Setup ---
+    pthread_t playback_tid, capture_tid;
+    audio_thread_data_t thread_data;
+    g_thread_data_ptr = &thread_data; // Set global pointer for signal handler
+    thread_data.running = 1; // Set running flag
 
-    // 2. Allocate HW params object
-    snd_pcm_hw_params_alloca(&hw_params);
+    // --- Setup Playback Stream ---
+    printf("--- Setting up Playback Stream (%s) ---\n", playback_device);
+    err = snd_pcm_open(&playback_handle, playback_device, SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK);
+    if (err < 0) { fprintf(stderr, "Cannot open playback device %s (%s)\n", playback_device, snd_strerror(err)); return 1; }
+    printf("Playback device opened.\n");
+    snd_pcm_hw_params_alloca(&playback_hw_params);
+    err = snd_pcm_hw_params_any(playback_handle, playback_hw_params);
+    if (err < 0) { fprintf(stderr, "Playback: Error getting default hw params: %s\n", snd_strerror(err)); snd_pcm_close(playback_handle); return 1; }
 
-    // 3. Fill it with default values
-    err = snd_pcm_hw_params_any(handle, hw_params);
-    if (err < 0) { fprintf(stderr, "Error getting default hw params: %s\n", snd_strerror(err)); snd_pcm_close(handle); return 1; }
-
-
-    // 4. Set HW parameters
-    // *** IMPORTANT: Set Access Mode to MMAP Interleaved or Non-Interleaved ***
-    snd_pcm_access_t access = interleaved ? SND_PCM_ACCESS_MMAP_INTERLEAVED : SND_PCM_ACCESS_MMAP_NONINTERLEAVED;
-    err = snd_pcm_hw_params_set_access(handle, hw_params, access);
-    if (err < 0) { fprintf(stderr, "Error setting access %s: %s\n", interleaved?"interleaved":"non-interleaved", snd_strerror(err)); snd_pcm_close(handle); return 1; }
-    printf("Access type set to: %s\n", snd_pcm_access_name(access));
-
-    err = snd_pcm_hw_params_set_format(handle, hw_params, format);
-     if (err < 0) { fprintf(stderr, "Error setting format %s: %s\n", snd_pcm_format_name(format), snd_strerror(err)); snd_pcm_close(handle); return 1; }
-     printf("Format set to: %s\n", snd_pcm_format_name(format));
-
-
-    err = snd_pcm_hw_params_set_rate_near(handle, hw_params, &rate, 0);
-     if (err < 0) { fprintf(stderr, "Error setting rate near %u Hz: %s\n", rate, snd_strerror(err)); snd_pcm_close(handle); return 1; }
-     printf("Rate set near: %u Hz\n", rate);
-
-
-    err = snd_pcm_hw_params_set_channels(handle, hw_params, channels);
-     if (err < 0) { fprintf(stderr, "Error setting channels to %u: %s\n", channels, snd_strerror(err)); snd_pcm_close(handle); return 1; }
-     printf("Channels set to: %u\n", channels);
-
-
-    // Set period size
-    int dir = 0; // Use 0 for default direction preference
-    err = snd_pcm_hw_params_set_period_size_near(handle, hw_params, &period_size, &dir);
-    if (err < 0) { fprintf(stderr, "Error setting period size near %lu: %s\n", period_size, snd_strerror(err)); snd_pcm_close(handle); return 1; }
-    err = snd_pcm_hw_params_get_period_size(hw_params, &period_size, &dir); // Get the actual size set
-    if (err < 0) { fprintf(stderr, "Error getting period size: %s\n", snd_strerror(err)); snd_pcm_close(handle); return 1; }
-    printf("Period size set to: %lu frames\n", period_size);
-
-
-    // Set buffer size (usually multiple periods, e.g., 2 to 4)
+    // Set Playback HW parameters (MMAP Interleaved)
+    snd_pcm_access_t playback_access = playback_interleaved ? SND_PCM_ACCESS_MMAP_INTERLEAVED : SND_PCM_ACCESS_MMAP_NONINTERLEAVED;
+    err = snd_pcm_hw_params_set_access(playback_handle, playback_hw_params, playback_access);
+    if (err < 0) { fprintf(stderr, "Playback: Error setting access %s: %s\n", snd_pcm_access_name(playback_access), snd_strerror(err)); snd_pcm_close(playback_handle); return 1; }
+    err = snd_pcm_hw_params_set_format(playback_handle, playback_hw_params, format);
+    if (err < 0) { fprintf(stderr, "Playback: Error setting format %s: %s\n", snd_pcm_format_name(format), snd_strerror(err)); snd_pcm_close(playback_handle); return 1; }
+    err = snd_pcm_hw_params_set_rate_near(playback_handle, playback_hw_params, &rate, 0);
+    if (err < 0) { fprintf(stderr, "Playback: Error setting rate near %u Hz: %s\n", rate, snd_strerror(err)); snd_pcm_close(playback_handle); return 1; }
+    err = snd_pcm_hw_params_set_channels(playback_handle, playback_hw_params, channels);
+    if (err < 0) { fprintf(stderr, "Playback: Error setting channels to %u: %s\n", channels, snd_strerror(err)); snd_pcm_close(playback_handle); return 1; }
+    int dir = 0;
+    err = snd_pcm_hw_params_set_period_size_near(playback_handle, playback_hw_params, &period_size, &dir);
+    if (err < 0) { fprintf(stderr, "Playback: Error setting period size near %lu: %s\n", period_size, snd_strerror(err)); snd_pcm_close(playback_handle); return 1; }
+    err = snd_pcm_hw_params_get_period_size(playback_hw_params, &period_size, &dir);
+    if (err < 0) { fprintf(stderr, "Playback: Error getting period size: %s\n", snd_strerror(err)); snd_pcm_close(playback_handle); return 1; }
     snd_pcm_uframes_t target_buffer_size = period_size * 4;
-    err = snd_pcm_hw_params_set_buffer_size_near(handle, hw_params, &target_buffer_size);
-     if (err < 0) { fprintf(stderr, "Error setting buffer size near %lu: %s\n", target_buffer_size, snd_strerror(err)); snd_pcm_close(handle); return 1; }
+    err = snd_pcm_hw_params_set_buffer_size_near(playback_handle, playback_hw_params, &target_buffer_size);
+    if (err < 0) { fprintf(stderr, "Playback: Error setting buffer size near %lu: %s\n", target_buffer_size, snd_strerror(err)); snd_pcm_close(playback_handle); return 1; }
+    err = snd_pcm_hw_params_get_buffer_size(playback_hw_params, &playback_buffer_size);
+    if (err < 0) { fprintf(stderr, "Playback: Error getting buffer size: %s\n", snd_strerror(err)); snd_pcm_close(playback_handle); return 1; }
+    err = snd_pcm_hw_params(playback_handle, playback_hw_params);
+    if (err < 0) { fprintf(stderr, "Playback: Unable to set hw params: %s\n", snd_strerror(err)); snd_pcm_close(playback_handle); return 1; }
+    printf("Playback HW params set: Rate=%u, Channels=%u, Format=%s, Period=%lu, Buffer=%lu\n", rate, channels, snd_pcm_format_name(format), period_size, playback_buffer_size);
 
-    // Get actual buffer size
-    err = snd_pcm_hw_params_get_buffer_size(hw_params, &buffer_size);
-     if (err < 0) { fprintf(stderr, "Error getting buffer size: %s\n", snd_strerror(err)); snd_pcm_close(handle); return 1; }
-     printf("Buffer size set to: %lu frames (%lu periods)\n", buffer_size, buffer_size / period_size);
+    // Set Playback SW parameters
+    snd_pcm_sw_params_alloca(&playback_sw_params);
+    snd_pcm_sw_params_current(playback_handle, playback_sw_params);
+    err = snd_pcm_sw_params_set_start_threshold(playback_handle, playback_sw_params, period_size);
+    if (err < 0) { fprintf(stderr, "Playback: Error setting start threshold: %s\n", snd_strerror(err)); }
+    err = snd_pcm_sw_params_set_avail_min(playback_handle, playback_sw_params, period_size);
+    if (err < 0) { fprintf(stderr, "Playback: Error setting avail min: %s\n", snd_strerror(err)); }
+    err = snd_pcm_sw_params(playback_handle, playback_sw_params);
+    if (err < 0) { fprintf(stderr, "Playback: Error setting sw params: %s\n", snd_strerror(err)); }
+    else { printf("Playback SW params set.\n"); }
 
+    // --- Setup Capture Stream ---
+    printf("--- Setting up Capture Stream (%s) ---\n", capture_device);
+    err = snd_pcm_open(&capture_handle, capture_device, SND_PCM_STREAM_CAPTURE, 0); // Use blocking for simple readi
+    if (err < 0) { fprintf(stderr, "Cannot open capture device %s (%s)\n", capture_device, snd_strerror(err)); snd_pcm_close(playback_handle); return 1; }
+    printf("Capture device opened.\n");
+    snd_pcm_hw_params_alloca(&capture_hw_params);
+    err = snd_pcm_hw_params_any(capture_handle, capture_hw_params);
+     if (err < 0) { fprintf(stderr, "Capture: Error getting default hw params: %s\n", snd_strerror(err)); snd_pcm_close(playback_handle); snd_pcm_close(capture_handle); return 1; }
 
-    // 5. Write HW parameters to the driver
-    err = snd_pcm_hw_params(handle, hw_params);
-    if (err < 0) {
-        fprintf(stderr, "Unable to set hw params for playback: %s\n", snd_strerror(err));
-        snd_pcm_close(handle);
-        return 1;
+    // Set Capture HW parameters (Read Interleaved)
+    // Important: Must match playback format, rate, channels for simple mixing
+    err = snd_pcm_hw_params_set_access(capture_handle, capture_hw_params, SND_PCM_ACCESS_RW_INTERLEAVED);
+    if (err < 0) { fprintf(stderr, "Capture: Error setting access RW_INTERLEAVED: %s\n", snd_strerror(err)); snd_pcm_close(playback_handle); snd_pcm_close(capture_handle); return 1; }
+    err = snd_pcm_hw_params_set_format(capture_handle, capture_hw_params, format);
+    if (err < 0) { fprintf(stderr, "Capture: Error setting format %s: %s\n", snd_pcm_format_name(format), snd_strerror(err)); snd_pcm_close(playback_handle); snd_pcm_close(capture_handle); return 1; }
+    unsigned int capture_rate = rate; // Ensure rate matches playback
+    err = snd_pcm_hw_params_set_rate_near(capture_handle, capture_hw_params, &capture_rate, 0);
+    if (err < 0 || capture_rate != rate) { fprintf(stderr, "Capture: Error setting rate near %u Hz (got %u): %s\n", rate, capture_rate, snd_strerror(err)); snd_pcm_close(playback_handle); snd_pcm_close(capture_handle); return 1; }
+    err = snd_pcm_hw_params_set_channels(capture_handle, capture_hw_params, channels);
+    if (err < 0) { fprintf(stderr, "Capture: Error setting channels to %u: %s\n", channels, snd_strerror(err)); snd_pcm_close(playback_handle); snd_pcm_close(capture_handle); return 1; }
+    snd_pcm_uframes_t capture_period_size = period_size; // Use same period size
+    err = snd_pcm_hw_params_set_period_size_near(capture_handle, capture_hw_params, &capture_period_size, &dir);
+    if (err < 0 || capture_period_size != period_size) { fprintf(stderr, "Capture: Error setting period size near %lu (got %lu): %s\n", period_size, capture_period_size, snd_strerror(err)); snd_pcm_close(playback_handle); snd_pcm_close(capture_handle); return 1; }
+    target_buffer_size = capture_period_size * 4;
+    err = snd_pcm_hw_params_set_buffer_size_near(capture_handle, capture_hw_params, &target_buffer_size);
+     if (err < 0) { fprintf(stderr, "Capture: Error setting buffer size near %lu: %s\n", target_buffer_size, snd_strerror(err)); snd_pcm_close(playback_handle); snd_pcm_close(capture_handle); return 1; }
+    err = snd_pcm_hw_params_get_buffer_size(capture_hw_params, &capture_buffer_size);
+    if (err < 0) { fprintf(stderr, "Capture: Error getting buffer size: %s\n", snd_strerror(err)); snd_pcm_close(playback_handle); snd_pcm_close(capture_handle); return 1; }
+    err = snd_pcm_hw_params(capture_handle, capture_hw_params);
+    if (err < 0) { fprintf(stderr, "Capture: Unable to set hw params: %s\n", snd_strerror(err)); snd_pcm_close(playback_handle); snd_pcm_close(capture_handle); return 1; }
+    printf("Capture HW params set: Rate=%u, Channels=%u, Format=%s, Period=%lu, Buffer=%lu\n", capture_rate, channels, snd_pcm_format_name(format), capture_period_size, capture_buffer_size);
+
+    // --- Prepare Thread Data ---
+    thread_data.playback_handle = playback_handle;
+    thread_data.capture_handle = capture_handle;
+    thread_data.period_size = period_size;
+    thread_data.format = format;
+    thread_data.channels = channels;
+    thread_data.playback_interleaved = playback_interleaved;
+
+    // Initialize Ring Buffer (e.g., size for 1 second of audio)
+    size_t ring_buffer_samples = rate * channels * 1; // 1 second buffer
+    thread_data.shared_buffer.buffer = malloc(ring_buffer_samples * sizeof(short));
+    if (!thread_data.shared_buffer.buffer) {
+        perror("Failed to allocate shared ring buffer");
+        snd_pcm_close(playback_handle); snd_pcm_close(capture_handle); return 1;
     }
-    printf("Hardware parameters set successfully.\n");
+    thread_data.shared_buffer.size = ring_buffer_samples;
+    thread_data.shared_buffer.write_pos = 0;
+    thread_data.shared_buffer.read_pos = 0;
+    thread_data.shared_buffer.count = 0;
+    printf("Shared ring buffer initialized (size = %zu samples)\n", ring_buffer_samples);
 
-    // 6. Set SW parameters (optional but recommended for MMAP)
-    snd_pcm_sw_params_alloca(&sw_params);
-    err = snd_pcm_sw_params_current(handle, sw_params);
-    if (err < 0) { fprintf(stderr, "Error getting current sw params: %s\n", snd_strerror(err)); snd_pcm_close(handle); return 1; }
-
-
-    // Start threshold: Start playing when buffer is at least this full (e.g., one period)
-    // For MMAP, often set close to buffer_size - period_size or just period_size.
-    // Setting it to period_size ensures playback starts quickly after first commit.
-    err = snd_pcm_sw_params_set_start_threshold(handle, sw_params, period_size);
-     if (err < 0) { fprintf(stderr, "Error setting start threshold: %s\n", snd_strerror(err)); }
-    else { snd_pcm_sw_params_get_start_threshold(sw_params, &target_buffer_size); printf("Start threshold set to: %lu frames\n", target_buffer_size); }
-
-
-    // Available minimum: Wake us up when at least period_size frames are available for writing
-    // This is crucial for snd_pcm_wait() to work efficiently with MMAP.
-    err = snd_pcm_sw_params_set_avail_min(handle, sw_params, period_size);
-     if (err < 0) { fprintf(stderr, "Error setting avail min: %s\n", snd_strerror(err)); }
-     else { snd_pcm_sw_params_get_avail_min(sw_params, &target_buffer_size); printf("Avail min set to: %lu frames\n", target_buffer_size); }
-
-
-    // Set period event generation (optional, can be useful for precise timing via poll/select)
-    // err = snd_pcm_sw_params_set_period_event(handle, sw_params, 1);
-    // if (err < 0) { fprintf(stderr, "Error setting period event: %s\n", snd_strerror(err)); }
-
-
-    // Write the software parameters.
-    err = snd_pcm_sw_params(handle, sw_params);
-     if (err < 0) { fprintf(stderr, "Error setting sw params: %s\n", snd_strerror(err)); }
-     else { printf("Software parameters set successfully.\n"); }
-
-
-    // 7. Run the MMAP loop
-    printf("Starting ALSA MMAP playback loop...\n");
-    err = run_alsa_mmap_loop(handle, period_size, format, channels, interleaved);
-    if (err < 0) {
-        fprintf(stderr, "Playback loop failed: %s\n", snd_strerror(err));
+    // Initialize Mutex and Condition Variables
+    if (pthread_mutex_init(&thread_data.buffer_mutex, NULL) != 0) {
+        perror("Mutex initialization failed");
+        free(thread_data.shared_buffer.buffer);
+        snd_pcm_close(playback_handle); snd_pcm_close(capture_handle); return 1;
+    }
+    if (pthread_cond_init(&thread_data.cond_not_full, NULL) != 0) {
+        perror("Condition variable (not full) initialization failed");
+        pthread_mutex_destroy(&thread_data.buffer_mutex); free(thread_data.shared_buffer.buffer);
+        snd_pcm_close(playback_handle); snd_pcm_close(capture_handle); return 1;
+    }
+     if (pthread_cond_init(&thread_data.cond_not_empty, NULL) != 0) {
+        perror("Condition variable (not empty) initialization failed");
+        pthread_cond_destroy(&thread_data.cond_not_full); pthread_mutex_destroy(&thread_data.buffer_mutex);
+        free(thread_data.shared_buffer.buffer);
+        snd_pcm_close(playback_handle); snd_pcm_close(capture_handle); return 1;
     }
 
-    // 8. Clean up
-    printf("Attempting to close audio stream...\n");
-    // snd_pcm_drain(handle); // Drain might block indefinitely in non-blocking mode if errors occurred
-    err = snd_pcm_drop(handle); // Drop is safer for non-blocking cleanup after errors
-    if (err < 0) { fprintf(stderr, "Error dropping PCM stream: %s\n", snd_strerror(err)); }
-    err = snd_pcm_close(handle);
-    if (err < 0) { fprintf(stderr, "Error closing PCM handle: %s\n", snd_strerror(err)); }
-    else { printf("Audio device closed.\n"); }
+
+    // --- Start Threads ---
+    printf("Starting threads...\n");
+    if (pthread_create(&capture_tid, NULL, capture_thread_func, &thread_data) != 0) {
+        perror("Failed to create capture thread");
+        snd_pcm_close(playback_handle); snd_pcm_close(capture_handle); return 1;
+    }
+    if (pthread_create(&playback_tid, NULL, playback_thread_func, &thread_data) != 0) {
+        perror("Failed to create playback thread");
+        thread_data.running = 0; // Signal capture thread to stop
+        pthread_join(capture_tid, NULL);
+        snd_pcm_close(playback_handle); snd_pcm_close(capture_handle); return 1;
+    }
+
+    // --- Wait for Threads (or signal handling) ---
+    printf("Threads started. Press Ctrl+C to stop.\n");
+    // Set up signal handler for graceful shutdown
+    signal(SIGINT, signal_handler);
+    // Wait for threads to complete (they will exit when data.running becomes 0)
+    pthread_join(playback_tid, NULL);
+    printf("Playback thread joined.\n");
+    // Ensure capture thread is signaled to stop if playback ends first
+    if (thread_data.running) {
+        thread_data.running = 0;
+        pthread_cond_signal(&thread_data.cond_not_full); // Wake up capture if waiting
+    }
+    pthread_join(capture_tid, NULL);
+    printf("Capture thread joined.\n");
+
+
+    // --- Cleanup ---
+    printf("Attempting cleanup...\n");
+    snd_pcm_close(playback_handle);
+    snd_pcm_close(capture_handle);
+    printf("Audio devices closed.\n");
+
+    // Destroy mutex and condition variables
+    pthread_mutex_destroy(&thread_data.buffer_mutex);
+    pthread_cond_destroy(&thread_data.cond_not_full);
+    pthread_cond_destroy(&thread_data.cond_not_empty);
+    printf("Mutex and condition variables destroyed.\n");
+
+    // Free shared buffer
+    free(thread_data.shared_buffer.buffer);
+    printf("Shared buffer freed.\n");
+
     printf("Playback finished.\n");
 
     return 0;
